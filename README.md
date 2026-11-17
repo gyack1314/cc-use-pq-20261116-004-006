@@ -4,16 +4,19 @@
 
 ## 运行
 
-使用 Python 3.11 或更新版本，无第三方依赖。先在项目根目录运行 `python -m orbitbridge demo --workspace /tmp/orbitbridge-demo`，可看到接收、重复导入、交接确认和来源核对结果。演示会重建指定目录中的 `demo.sqlite3`；请仅使用专门的演示目录。
+使用 Python 3.11 或更新版本，无第三方依赖。先在项目根目录运行 `python -m orbitbridge demo --workspace /tmp/orbitbridge-demo`，可看到接收、重复导入、领取、交接确认和来源核对结果。演示会重建指定目录中的 `demo.sqlite3`；请仅使用专门的演示目录。
 
 真实本地包的命令顺序为：
 
 ```text
 python -m orbitbridge --db work.sqlite3 station-add sat-a "站点 A"
 python -m orbitbridge --db work.sqlite3 subscribe north-watch forest-north --severity 3 --confidence 0.7
+python -m orbitbridge --db work.sqlite3 group-add night-shift "夜班一组"
+python -m orbitbridge --db work.sqlite3 roster-add north-watch night-shift
 python -m orbitbridge --db work.sqlite3 ingest packet.jsonl
 python -m orbitbridge --db work.sqlite3 handoffs --status pending
-python -m orbitbridge --db work.sqlite3 ack 1 "值守员甲"
+python -m orbitbridge --db work.sqlite3 claim 1 night-shift "值守员甲" --ttl-seconds 14400
+python -m orbitbridge --db work.sqlite3 ack 1 "值守员甲" --claim 1
 python -m orbitbridge --db work.sqlite3 trace 1
 python -m orbitbridge --db work.sqlite3 verify
 ```
@@ -21,6 +24,8 @@ python -m orbitbridge --db work.sqlite3 verify
 包第一行为 `kind=packet`、`schema=1`、`station_id`、正整数 `sequence`、带时区 `created_at`、`record_count`、`digest`。后续每行是 `kind=observation`，包含 `id`、带时区 `observed_at`、`region`、`latitude`、`longitude`、`confidence`、1–5 的 `severity` 和 `source`。`source` 可为 `infrared`、`optical`、`thermal`。摘要是每条记录按键排序、紧凑 UTF-8 JSON 表示后追加换行的 SHA-256。可参考 `orbitbridge.protocol.encode_packet` 生成测试包。
 
 同站点序号须连续。相同包重放返回 `duplicate`，相同序号不同内容或跳号进入隔离记录。所有观测和交接项在一个 SQLite 事务中提交；无匹配订阅的观测仍被保存。订阅规则只影响后续提交的包。`verify` 检查数据库、游标、批次数与交接来源。
+
+交接确认实行有期限的领取制。班组用 `group-add` 登记（`groups` 查看），`roster-add` 按 `--position` 顺序加入订阅的接班序列（`roster` 查看），只有序列内且未停用的班组有资格负责。`claim` 为交接项建立领取，默认期限 4 小时，可用 `--ttl-seconds` 调整（最长 7 天）；只有当前有效的领取才能用 `ack --claim` 确认，同一领取同一操作人重复确认返回 `duplicate`。`sweep` 处理已到期的领取并按接班顺序再分派给下一个有资格的班组；`claim`、`ack`、`handoffs`、`claims`、`trace` 等命令执行前也会先处理到期部分。领取期限和接班安排持久化在数据库中，重启后继续按原期限处理。`group-state` 停用班组或 `roster-state` 停用资格时，该班组已领取的待办立即按同一接班政策再分派，未领取的存量待办和新采集的待办一样只能由有资格的班组领取，而不只是改变后续新包的路由。旧领取的晚到确认不会覆盖新班组，而是保留为 `disputes` 争议记录。一个观测命中多个订阅时，各订阅的交接项独立领取、独立确认，完成一个不替其他组销账。`trace` 沿原包列出全部换班历史、当前责任班组、已失效的旧领取和争议；`claims` 可按班组或状态查看领取清单。
 
 可用 `inspect-packet` 或 `inspect-dir` 在不改数据库的情况下诊断待收件文件。目录中存在跳号时，先用 `recovery-plan sat-a incoming/` 查看可连续提交的包，再用 `recovery-resume sat-a incoming/` 按站点序号接收。`quarantine-retry <编号> <原文件>` 只允许重检与隔离记录身份一致的包。
 

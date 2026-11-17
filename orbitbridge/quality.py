@@ -51,6 +51,32 @@ def check_all(connection: sqlite3.Connection) -> dict[str, Any]:
             issue("created_before_batch", "handoff", identifier, "交接时间早于批次接收时间")
         if row["status"] == "acknowledged" and row["acknowledged_at"] < row["created_at"]:
             issue("ack_before_create", "handoff", identifier, "确认时间早于交接创建时间")
+    for row in connection.execute("SELECT handoff_id,COUNT(*) AS amount FROM claims WHERE status='active' "
+                                  "GROUP BY handoff_id HAVING amount>1"):
+        issue("claim_active_multiple", "handoff", str(row["handoff_id"]), "同一交接项存在多个有效领取")
+    sequences: dict[int, list[int]] = {}
+    for row in connection.execute("SELECT c.*,h.status AS handoff_status,h.acknowledged_at AS handoff_acknowledged "
+                                  "FROM claims c JOIN handoffs h USING(handoff_id) ORDER BY c.handoff_id,c.sequence"):
+        identifier = str(row["claim_id"])
+        sequences.setdefault(row["handoff_id"], []).append(row["sequence"])
+        if row["deadline"] < row["claimed_at"]:
+            issue("claim_deadline", "claim", identifier, "领取期限早于领取时间")
+        if row["status"] == "active" and row["handoff_status"] != "pending":
+            issue("claim_on_closed_handoff", "claim", identifier, "已结清交接项仍有有效领取")
+        if row["status"] == "acknowledged" and (row["handoff_status"] != "acknowledged"
+                                                or row["handoff_acknowledged"] != row["resolved_at"]):
+            issue("claim_ack_mismatch", "claim", identifier, "领取确认与交接确认不一致")
+    for handoff_id, order in sequences.items():
+        if order != list(range(1, len(order) + 1)):
+            issue("claim_sequence_gap", "handoff", str(handoff_id), "领取序号不连续")
+    for row in connection.execute("SELECT handoff_id FROM handoffs WHERE status='acknowledged' AND NOT EXISTS "
+                                  "(SELECT 1 FROM claims WHERE claims.handoff_id=handoffs.handoff_id "
+                                  "AND claims.status='acknowledged')"):
+        issue("ack_without_claim", "handoff", str(row["handoff_id"]), "已确认交接项缺少已确认领取")
+    for row in connection.execute("SELECT d.dispute_id,d.handoff_id,c.handoff_id AS claim_handoff "
+                                  "FROM disputes d JOIN claims c USING(claim_id)"):
+        if row["handoff_id"] != row["claim_handoff"]:
+            issue("dispute_handoff_mismatch", "dispute", str(row["dispute_id"]), "争议与领取不属于同一交接项")
     return {"ok": not issues, "issues": issues, "counts": store.counts(connection)}
 
 

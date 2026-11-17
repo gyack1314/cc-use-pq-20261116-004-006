@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from orbitbridge import audit, diagnostics, export, handoff, ingest, quality, reconcile, store
-from helpers import DatabaseCase, STAMP, observation, packet
+from helpers import DatabaseCase, STAMP, observation, packet, register_duty
 
 
 class ReportingTests(DatabaseCase):
@@ -31,7 +31,9 @@ class ReportingTests(DatabaseCase):
 
     def test_export_status_filter_uses_current_ack_state(self):
         self._seed_two()
-        handoff.acknowledge(self.db, 1, "operator-a", when="2026-10-28T12:04:00Z")
+        register_duty(self.db)
+        claim = handoff.claim_handoff(self.db, 1, "shift-a", "operator-a", when="2026-10-28T12:03:30Z")
+        handoff.acknowledge(self.db, 1, "operator-a", claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         receipt = export.export_handoffs(self.db, "north-watch", self.root / "pending.jsonl", status="pending")
         self.assertEqual(receipt.rows, 1)
         row = json.loads((self.root / "pending.jsonl").read_text())
@@ -81,7 +83,9 @@ class ReportingTests(DatabaseCase):
 
     def test_subscription_reconciliation_tracks_acknowledgments(self):
         self._seed_two()
-        handoff.acknowledge(self.db, 1, "operator-a", when="2026-10-28T12:04:00Z")
+        register_duty(self.db)
+        claim = handoff.claim_handoff(self.db, 1, "shift-a", "operator-a", when="2026-10-28T12:03:30Z")
+        handoff.acknowledge(self.db, 1, "operator-a", claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         report = reconcile.subscription_counts(self.db, "north-watch")
         self.assertTrue(report["balanced"])
         self.assertEqual(report["handoff_count"], 2)

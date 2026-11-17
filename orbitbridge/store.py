@@ -47,6 +47,37 @@ CREATE TABLE IF NOT EXISTS handoffs (
         (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS handoffs_status ON handoffs(status, subscription_id);
+CREATE TABLE IF NOT EXISTS duty_groups (
+  group_id TEXT PRIMARY KEY, label TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)),
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_roster (
+  subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+  group_id TEXT NOT NULL REFERENCES duty_groups(group_id),
+  position INTEGER NOT NULL CHECK(position > 0),
+  active INTEGER NOT NULL CHECK(active IN (0,1)), created_at TEXT NOT NULL,
+  PRIMARY KEY(subscription_id, group_id)
+);
+CREATE TABLE IF NOT EXISTS claims (
+  claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  handoff_id INTEGER NOT NULL REFERENCES handoffs(handoff_id),
+  group_id TEXT NOT NULL REFERENCES duty_groups(group_id),
+  sequence INTEGER NOT NULL CHECK(sequence > 0), operator TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('active','expired','superseded','acknowledged')),
+  claimed_at TEXT NOT NULL, deadline TEXT NOT NULL, resolved_at TEXT,
+  UNIQUE(handoff_id, sequence),
+  CHECK((status='active' AND resolved_at IS NULL) OR
+        (status IN ('expired','superseded','acknowledged') AND resolved_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS claims_one_active ON claims(handoff_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS claims_group ON claims(group_id, status);
+CREATE TABLE IF NOT EXISTS disputes (
+  dispute_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  handoff_id INTEGER NOT NULL REFERENCES handoffs(handoff_id),
+  claim_id INTEGER NOT NULL REFERENCES claims(claim_id),
+  operator TEXT NOT NULL, reason TEXT NOT NULL, attempted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS disputes_handoff ON disputes(handoff_id);
 CREATE TABLE IF NOT EXISTS quarantine (
   quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT, station_id TEXT, sequence INTEGER, source_name TEXT NOT NULL,
   content_digest TEXT NOT NULL, reason_code TEXT NOT NULL, detail TEXT NOT NULL,
@@ -170,8 +201,13 @@ def get_handoff(connection: sqlite3.Connection, handoff_id: int) -> dict[str, An
     return one(connection, "SELECT * FROM handoffs WHERE handoff_id=?", (handoff_id,))
 
 
+def get_claim(connection: sqlite3.Connection, claim_id: int) -> dict[str, Any] | None:
+    return one(connection, "SELECT * FROM claims WHERE claim_id=?", (claim_id,))
+
+
 def counts(connection: sqlite3.Connection) -> dict[str, int]:
-    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity")
+    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity",
+             "duty_groups", "subscription_roster", "claims", "disputes")
     return {name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
 
 

@@ -120,12 +120,31 @@ def region_report(connection: sqlite3.Connection, region: str) -> dict[str, Any]
             "subscriptions": catalog.list_subscriptions(connection, region)}
 
 
-def handoff_trace(connection: sqlite3.Connection, handoff_id: int) -> dict[str, Any]:
+def handoff_trace(connection: sqlite3.Connection, handoff_id: int, *, when: str | None = None) -> dict[str, Any]:
+    handoff.sweep(connection, when=when)
     detail = handoff.handoff_detail(connection, handoff_id)
     if detail is None:
         raise AuditError("handoff_missing", "交接项不存在")
-    history = list_activity(connection, entity_type="handoff", entity_id=str(handoff_id), limit=1000)
-    return {"handoff": detail, "activity": history}
+    claims = handoff.list_claims(connection, handoff_id=handoff_id, limit=1000, when=when)
+    disputes = handoff.list_disputes(connection, handoff_id=handoff_id, limit=1000)
+    current = next((claim for claim in claims if claim["status"] == "active"), None)
+    invalidated = [claim for claim in claims if claim["status"] in ("expired", "superseded")]
+    activity = _trace_activity(connection, handoff_id, claims, disputes)
+    return {"handoff": detail, "claims": claims, "current_claim": current,
+            "invalidated_claims": invalidated, "disputes": disputes, "activity": activity}
+
+
+def _trace_activity(connection: sqlite3.Connection, handoff_id: int,
+                    claims: list[dict[str, Any]], disputes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entities = [("handoff", str(handoff_id))]
+    entities.extend(("claim", str(claim["claim_id"])) for claim in claims)
+    entities.extend(("dispute", str(dispute["dispute_id"])) for dispute in disputes)
+    clause = " OR ".join("(entity_type=? AND entity_id=?)" for _ in entities)
+    args = [value for entity in entities for value in entity]
+    rows = store.many(connection, f"SELECT * FROM activity WHERE {clause} ORDER BY activity_id LIMIT 1000", tuple(args))
+    for row in rows:
+        row["details"] = json.loads(row.pop("details_json"))
+    return rows
 
 
 def summary(connection: sqlite3.Connection) -> dict[str, Any]:

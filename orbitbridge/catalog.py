@@ -114,3 +114,88 @@ def list_subscriptions(connection: sqlite3.Connection, region: str | None = None
     if region is not None:
         return store.many(connection, "SELECT * FROM subscriptions WHERE region=? ORDER BY subscription_id", (region,))
     return store.many(connection, "SELECT * FROM subscriptions ORDER BY subscription_id")
+
+
+def register_group(connection: sqlite3.Connection, group_id: str, label: str, *, when: str | None = None) -> dict[str, Any]:
+    _identifier(group_id, "班组")
+    if not isinstance(label, str) or not 1 <= len(label.strip()) <= 120:
+        raise CatalogError("label", "班组名称无效")
+    timestamp = when or utc_now()
+    with store.transaction(connection):
+        if store.one(connection, "SELECT 1 FROM duty_groups WHERE group_id=?", (group_id,)):
+            raise CatalogError("group_exists", "班组已存在")
+        connection.execute("INSERT INTO duty_groups VALUES(?,?,1,?)", (group_id, label.strip(), timestamp))
+        store.record_activity(connection, "group_registered", "group", group_id, timestamp, {"label": label.strip()})
+    return group(connection, group_id)
+
+
+def group(connection: sqlite3.Connection, group_id: str) -> dict[str, Any] | None:
+    return store.one(connection, "SELECT * FROM duty_groups WHERE group_id=?", (group_id,))
+
+
+def list_groups(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    return store.many(connection, "SELECT * FROM duty_groups ORDER BY group_id")
+
+
+def roster_add(connection: sqlite3.Connection, subscription_id: str, group_id: str,
+               *, position: int | None = None, when: str | None = None) -> dict[str, Any]:
+    if subscription(connection, subscription_id) is None:
+        raise CatalogError("subscription_missing", "订阅不存在")
+    if group(connection, group_id) is None:
+        raise CatalogError("group_missing", "班组不存在")
+    if position is not None and (type(position) is not int or position < 1):
+        raise CatalogError("position", "接班顺序须为正整数")
+    timestamp = when or utc_now()
+    with store.transaction(connection):
+        if store.one(connection, "SELECT 1 FROM subscription_roster WHERE subscription_id=? AND group_id=?",
+                     (subscription_id, group_id)):
+            raise CatalogError("roster_exists", "班组已在该订阅的接班序列中")
+        if position is None:
+            position = int(connection.execute(
+                "SELECT COALESCE(MAX(position),0)+1 FROM subscription_roster WHERE subscription_id=?",
+                (subscription_id,)).fetchone()[0])
+        connection.execute("INSERT INTO subscription_roster VALUES(?,?,?,1,?)",
+                           (subscription_id, group_id, position, timestamp))
+        store.record_activity(connection, "roster_added", "subscription", subscription_id, timestamp,
+                              {"group_id": group_id, "position": position})
+    return roster_entry(connection, subscription_id, group_id)
+
+
+def roster_entry(connection: sqlite3.Connection, subscription_id: str, group_id: str) -> dict[str, Any] | None:
+    return store.one(connection, "SELECT r.*,g.label,g.active AS group_active FROM subscription_roster r "
+                     "JOIN duty_groups g USING(group_id) WHERE r.subscription_id=? AND r.group_id=?",
+                     (subscription_id, group_id))
+
+
+def roster(connection: sqlite3.Connection, subscription_id: str) -> list[dict[str, Any]]:
+    if subscription(connection, subscription_id) is None:
+        raise CatalogError("subscription_missing", "订阅不存在")
+    return store.many(connection, "SELECT r.*,g.label,g.active AS group_active FROM subscription_roster r "
+                      "JOIN duty_groups g USING(group_id) WHERE r.subscription_id=? ORDER BY r.position,r.group_id",
+                      (subscription_id,))
+
+
+def eligible_groups(connection: sqlite3.Connection, subscription_id: str) -> list[dict[str, Any]]:
+    return store.many(connection, "SELECT r.group_id,r.position FROM subscription_roster r "
+                      "JOIN duty_groups g USING(group_id) "
+                      "WHERE r.subscription_id=? AND r.active=1 AND g.active=1 ORDER BY r.position,r.group_id",
+                      (subscription_id,))
+
+
+def next_eligible_group(connection: sqlite3.Connection, subscription_id: str,
+                        after_group_id: str | None) -> str | None:
+    eligible = eligible_groups(connection, subscription_id)
+    if not eligible:
+        return None
+    if after_group_id is None:
+        return eligible[0]["group_id"]
+    full = store.many(connection, "SELECT group_id,position FROM subscription_roster WHERE subscription_id=? "
+                      "ORDER BY position,group_id", (subscription_id,))
+    anchor = next((entry for entry in full if entry["group_id"] == after_group_id), None)
+    if anchor is None:
+        return eligible[0]["group_id"]
+    key = (anchor["position"], anchor["group_id"])
+    for entry in eligible:
+        if (entry["position"], entry["group_id"]) > key:
+            return entry["group_id"]
+    return eligible[0]["group_id"]

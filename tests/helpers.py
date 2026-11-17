@@ -23,6 +23,13 @@ def packet(sequence: int = 1, records: list[dict] | None = None, *, station: str
     return protocol.encode_packet(station, sequence, created_at, records or [observation()])
 
 
+def register_duty(db, subscription: str = "north-watch", groups: tuple = ("shift-a",), when: str = STAMP) -> None:
+    for position, group in enumerate(groups, 1):
+        if catalog.group(db, group) is None:
+            catalog.register_group(db, group, f"值守班组 {group}", when=when)
+        catalog.roster_add(db, subscription, group, position=position, when=when)
+
+
 class DatabaseCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

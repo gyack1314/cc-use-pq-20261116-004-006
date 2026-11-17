@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from orbitbridge import audit, catalog, handoff, ingest, store
-from helpers import DatabaseCase, STAMP, observation, packet
+from helpers import DatabaseCase, STAMP, observation, packet, register_duty
 
 
 class HandoffTests(DatabaseCase):
@@ -9,6 +9,9 @@ class HandoffTests(DatabaseCase):
         result = ingest.ingest_bytes(self.db, packet(), when=STAMP)
         item = handoff.list_handoffs(self.db)[0]
         return result, item
+
+    def _claim(self, handoff_id, group="shift-a", operator="operator-a", when="2026-10-28T12:03:30Z", **kwargs):
+        return handoff.claim_handoff(self.db, handoff_id, group, operator, when=when, **kwargs)
 
     def test_handoff_includes_packet_provenance(self):
         result, item = self._create()
@@ -21,40 +24,58 @@ class HandoffTests(DatabaseCase):
 
     def test_acknowledge_updates_state_and_activity(self):
         _, item = self._create()
-        response = handoff.acknowledge(self.db, item["handoff_id"], "operator-a", when="2026-10-28T12:04:00Z")
+        register_duty(self.db)
+        claim = self._claim(item["handoff_id"])
+        response = handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                                       claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         self.assertEqual(response["status"], "acknowledged")
         self.assertEqual(response["operator"], "operator-a")
+        self.assertEqual(response["claim_id"], claim["claim_id"])
         self.assertEqual(len(handoff.list_handoffs(self.db, status="pending")), 0)
         self.assertEqual(len(handoff.list_handoffs(self.db, status="acknowledged")), 1)
         events = audit.list_activity(self.db, entity_type="handoff", entity_id=str(item["handoff_id"]))
         self.assertEqual([event["event_type"] for event in events], ["handoff_created", "handoff_acknowledged"])
+        self.assertEqual(events[1]["details"]["claim_id"], claim["claim_id"])
+        self.assertEqual(events[1]["details"]["group_id"], "shift-a")
 
     def test_same_operator_duplicate_ack_is_idempotent(self):
         _, item = self._create()
-        handoff.acknowledge(self.db, item["handoff_id"], "operator-a", when="2026-10-28T12:04:00Z")
+        register_duty(self.db)
+        claim = self._claim(item["handoff_id"])
+        handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                            claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         activity_before = store.counts(self.db)["activity"]
-        again = handoff.acknowledge(self.db, item["handoff_id"], "operator-a", when="2026-10-28T12:05:00Z")
+        again = handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                                    claim_id=claim["claim_id"], when="2026-10-28T12:05:00Z")
         self.assertEqual(again["status"], "duplicate")
         self.assertEqual(again["acknowledged_at"], "2026-10-28T12:04:00Z")
         self.assertEqual(store.counts(self.db)["activity"], activity_before)
 
-    def test_other_operator_cannot_claim_acknowledged_item(self):
+    def test_late_ack_on_spent_claim_becomes_dispute(self):
         _, item = self._create()
-        handoff.acknowledge(self.db, item["handoff_id"], "operator-a")
-        with self.assertRaises(handoff.HandoffError) as error:
-            handoff.acknowledge(self.db, item["handoff_id"], "operator-b")
-        self.assertEqual(error.exception.code, "already_acknowledged")
+        register_duty(self.db)
+        claim = self._claim(item["handoff_id"])
+        handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                            claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
+        result = handoff.acknowledge(self.db, item["handoff_id"], "operator-b",
+                                     claim_id=claim["claim_id"], when="2026-10-28T12:05:00Z")
+        self.assertEqual(result["status"], "disputed")
+        self.assertEqual(result["reason"], "acknowledged")
         self.assertEqual(store.get_handoff(self.db, item["handoff_id"])["operator"], "operator-a")
+        disputes = handoff.list_disputes(self.db, handoff_id=item["handoff_id"])
+        self.assertEqual(len(disputes), 1)
+        self.assertEqual(disputes[0]["operator"], "operator-b")
+        self.assertEqual(disputes[0]["claim_id"], claim["claim_id"])
 
     def test_missing_handoff_is_rejected(self):
         with self.assertRaises(handoff.HandoffError) as error:
-            handoff.acknowledge(self.db, 100, "operator-a")
+            handoff.acknowledge(self.db, 100, "operator-a", claim_id=1)
         self.assertEqual(error.exception.code, "handoff_missing")
 
     def test_operator_cannot_be_empty(self):
         _, item = self._create()
         with self.assertRaises(handoff.HandoffError) as error:
-            handoff.acknowledge(self.db, item["handoff_id"], "  ")
+            handoff.acknowledge(self.db, item["handoff_id"], "  ", claim_id=1)
         self.assertEqual(error.exception.code, "operator")
 
     def test_queue_filter_uses_subscription_and_status(self):
@@ -76,9 +97,12 @@ class HandoffTests(DatabaseCase):
 
     def test_subscription_summary_tracks_acknowledgment(self):
         _, item = self._create()
+        register_duty(self.db)
         before = handoff.subscription_summary(self.db, "north-watch")
         self.assertEqual((before["pending"], before["acknowledged"]), (1, 0))
-        handoff.acknowledge(self.db, item["handoff_id"], "operator-a")
+        claim = self._claim(item["handoff_id"])
+        handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                            claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         after = handoff.subscription_summary(self.db, "north-watch")
         self.assertEqual((after["pending"], after["acknowledged"]), (0, 1))
 
@@ -97,10 +121,13 @@ class HandoffTests(DatabaseCase):
 
     def test_region_report_reconciles_pending_and_acknowledged(self):
         _, item = self._create()
+        register_duty(self.db)
         before = audit.region_report(self.db, "north")
         self.assertEqual(before["observations"], 1)
         self.assertEqual(before["pending"], 1)
-        handoff.acknowledge(self.db, item["handoff_id"], "operator-a")
+        claim = self._claim(item["handoff_id"])
+        handoff.acknowledge(self.db, item["handoff_id"], "operator-a",
+                            claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         after = audit.region_report(self.db, "north")
         self.assertEqual(after["pending"], 0)
         self.assertEqual(after["acknowledged"], 1)

@@ -28,6 +28,23 @@ def parser() -> argparse.ArgumentParser:
     substate = commands.add_parser("subscription-state", help="变更订阅状态")
     substate.add_argument("subscription_id")
     substate.add_argument("state", choices=("active", "inactive"))
+    group = commands.add_parser("group-add", help="登记值守班组")
+    group.add_argument("group_id")
+    group.add_argument("label")
+    group_state = commands.add_parser("group-state", help="变更班组状态，停用时已领取待办按接班政策再分派")
+    group_state.add_argument("group_id")
+    group_state.add_argument("state", choices=("active", "inactive"))
+    commands.add_parser("groups", help="查看值守班组")
+    roster_add = commands.add_parser("roster-add", help="把班组加入订阅接班序列")
+    roster_add.add_argument("subscription_id")
+    roster_add.add_argument("group_id")
+    roster_add.add_argument("--position", type=int)
+    roster_state = commands.add_parser("roster-state", help="变更接班资格，停用时该订阅已领取待办再分派")
+    roster_state.add_argument("subscription_id")
+    roster_state.add_argument("group_id")
+    roster_state.add_argument("state", choices=("active", "inactive"))
+    roster_view = commands.add_parser("roster", help="查看订阅接班序列")
+    roster_view.add_argument("subscription_id")
     packet = commands.add_parser("ingest", help="导入单个观测包")
     packet.add_argument("packet")
     directory = commands.add_parser("ingest-dir", help="按文件名导入目录中的 JSONL")
@@ -35,12 +52,30 @@ def parser() -> argparse.ArgumentParser:
     directory.add_argument("--stop-on-error", action="store_true")
     queue = commands.add_parser("handoffs", help="查看交接队列")
     queue.add_argument("--subscription")
+    queue.add_argument("--group")
     queue.add_argument("--status", choices=("pending", "acknowledged"))
     queue.add_argument("--limit", type=int, default=100)
     queue.add_argument("--after", type=int, default=0)
-    acknowledgement = commands.add_parser("ack", help="确认交接项")
+    claim = commands.add_parser("claim", help="领取交接项，建立有期限的责任")
+    claim.add_argument("handoff_id", type=int)
+    claim.add_argument("group_id")
+    claim.add_argument("operator")
+    claim.add_argument("--ttl-seconds", type=int)
+    claims = commands.add_parser("claims", help="查看领取记录")
+    claims.add_argument("--handoff", type=int)
+    claims.add_argument("--group")
+    claims.add_argument("--status", choices=("active", "expired", "superseded", "acknowledged"))
+    claims.add_argument("--limit", type=int, default=100)
+    claims.add_argument("--after", type=int, default=0)
+    commands.add_parser("sweep", help="处理到期领取并按接班顺序再分派")
+    disputes = commands.add_parser("disputes", help="查看旧领取的晚到确认争议")
+    disputes.add_argument("--handoff", type=int)
+    disputes.add_argument("--limit", type=int, default=100)
+    disputes.add_argument("--after", type=int, default=0)
+    acknowledgement = commands.add_parser("ack", help="用当前有效领取确认交接项")
     acknowledgement.add_argument("handoff_id", type=int)
     acknowledgement.add_argument("operator")
+    acknowledgement.add_argument("--claim", type=int, required=True)
     batch = commands.add_parser("batch", help="查看批次来源")
     batch.add_argument("batch_id", type=int)
     observation = commands.add_parser("observation", help="查看观测来源")
@@ -105,6 +140,8 @@ def _demo(workspace: Path) -> dict[str, Any]:
         catalog.register_station(connection, "sat-a", "合成观测站 A", when="2026-10-28T12:00:00Z")
         catalog.register_subscription(connection, "forest-watch", "forest-north", 3, "0.70",
                                       when="2026-10-28T12:00:00Z")
+        catalog.register_group(connection, "night-shift", "夜班值守组", when="2026-10-28T12:00:00Z")
+        catalog.roster_add(connection, "forest-watch", "night-shift", when="2026-10-28T12:00:00Z")
         records = [
             {"kind": "observation", "id": "sim-001", "observed_at": "2026-10-28T12:00:00Z",
              "region": "forest-north", "latitude": 31.20, "longitude": 121.45, "confidence": "0.88",
@@ -121,13 +158,19 @@ def _demo(workspace: Path) -> dict[str, Any]:
         queue = handoff.list_handoffs(connection)
         if len(queue) != 1 or accepted.handoff_count != 1 or duplicate.status != "duplicate":
             raise RuntimeError("合成演示结果与交接预期不符")
+        claim = handoff.claim_handoff(connection, queue[0]["handoff_id"], "night-shift", "值守员甲",
+                                      when="2026-10-28T12:03:30Z")
+        if claim["status"] != "active" or claim["deadline"] != "2026-10-28T16:03:30Z":
+            raise RuntimeError("合成演示领取结果与期限预期不符")
         ack = handoff.acknowledge(connection, queue[0]["handoff_id"], "值守员甲",
-                                  when="2026-10-28T12:04:00Z")
+                                  claim_id=claim["claim_id"], when="2026-10-28T12:04:00Z")
         trace = audit.handoff_trace(connection, queue[0]["handoff_id"])
         issues = audit.verify_lineage(connection)
         if issues or trace["handoff"]["batch_id"] != accepted.batch_id:
             raise RuntimeError(f"合成演示来源链不一致：{issues}")
-        return {"accepted": accepted.as_dict(), "duplicate": duplicate.as_dict(),
+        if trace["current_claim"] is not None or len(trace["claims"]) != 1:
+            raise RuntimeError("合成演示领取链不一致")
+        return {"accepted": accepted.as_dict(), "duplicate": duplicate.as_dict(), "claim": claim,
                 "handoff": ack, "counts": store.counts(connection), "integrity_issues": issues}
     finally:
         connection.close()
@@ -147,15 +190,39 @@ def dispatch(args: argparse.Namespace) -> Any:
                                                  args.severity, args.confidence)
         if args.command == "subscription-state":
             return catalog.set_subscription_active(connection, args.subscription_id, args.state == "active")
+        if args.command == "group-add":
+            return catalog.register_group(connection, args.group_id, args.label)
+        if args.command == "group-state":
+            return handoff.apply_group_state(connection, args.group_id, args.state == "active")
+        if args.command == "groups":
+            return catalog.list_groups(connection)
+        if args.command == "roster-add":
+            return catalog.roster_add(connection, args.subscription_id, args.group_id, position=args.position)
+        if args.command == "roster-state":
+            return handoff.apply_roster_state(connection, args.subscription_id, args.group_id,
+                                              args.state == "active")
+        if args.command == "roster":
+            return catalog.roster(connection, args.subscription_id)
         if args.command == "ingest":
             return ingest.ingest_file(connection, args.packet).as_dict()
         if args.command == "ingest-dir":
             return ingest.ingest_directory(connection, args.directory, stop_on_error=args.stop_on_error)
         if args.command == "handoffs":
-            return handoff.list_handoffs(connection, subscription_id=args.subscription, status=args.status,
-                                         limit=args.limit, after_id=args.after)
+            return handoff.list_handoffs(connection, subscription_id=args.subscription, group_id=args.group,
+                                         status=args.status, limit=args.limit, after_id=args.after)
+        if args.command == "claim":
+            return handoff.claim_handoff(connection, args.handoff_id, args.group_id, args.operator,
+                                         ttl_seconds=args.ttl_seconds)
+        if args.command == "claims":
+            return handoff.list_claims(connection, handoff_id=args.handoff, group_id=args.group,
+                                       status=args.status, limit=args.limit, after_id=args.after)
+        if args.command == "sweep":
+            return handoff.sweep(connection)
+        if args.command == "disputes":
+            return handoff.list_disputes(connection, handoff_id=args.handoff, limit=args.limit,
+                                         after_id=args.after)
         if args.command == "ack":
-            return handoff.acknowledge(connection, args.handoff_id, args.operator)
+            return handoff.acknowledge(connection, args.handoff_id, args.operator, claim_id=args.claim)
         if args.command == "batch":
             return audit.batch_detail(connection, args.batch_id)
         if args.command == "observation":
